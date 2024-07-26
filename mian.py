@@ -1,129 +1,139 @@
-import numpy as np, torch, torch.nn as nn, torch.nn.functional as F, torch.optim as optim, gym
-from typing import NamedTuple, List
+import numpy as np,torch,torch.nn as nn,torch.nn.functional as F,torch.optim as optim,gym,random,math
+from typing import NamedTuple,List,Tuple
 from torch.distributions import Categorical
-from collections import deque
+from collections import deque,namedtuple
 
-class Exp(NamedTuple): s: np.ndarray; a: int; r: float; ns: np.ndarray; d: bool; i: float
+
+Exp=namedtuple('Exp','s a r ns d i')
 
 class PER:
-    def __init__(self, cap: int, α: float = 0.6, β: float = 0.4, βi: float = 0.001):
-        self.cap, self.α, self.β, self.βi, self.max_p = cap, α, β, βi, 1.0
-        self.tree, self.data = np.zeros(2*cap-1), np.empty(cap, dtype=object)
-        self.size = self.ptr = 0
-
-    def add(self, e: Exp):
-        idx = self.ptr + self.cap - 1
-        self.data[self.ptr] = e; self.update(idx, self.max_p)
-        self.ptr = (self.ptr + 1) % self.cap; self.size = min(self.size + 1, self.cap)
-
-    def update(self, idx: int, p: float):
-        change = p - self.tree[idx]; self.max_p = max(p, self.max_p)
-        while idx >= 0: self.tree[idx] += change; idx = (idx - 1) // 2
-
-    def sample(self, n: int):
-        idxs = [self.get(np.random.uniform(i*seg, (i+1)*seg)) for i, seg in enumerate(np.linspace(0, self.tree[0], n+1)[:-1])]
-        probs = self.tree[idxs + self.cap - 1] / self.tree[0]
-        self.β = min(1., self.β + self.βi)
-        weights = (self.size * probs) ** -self.β / max((self.size * probs) ** -self.β)
-        return [self.data[i] for i in idxs], idxs, weights
-
-    def get(self, v: float):
-        idx = 0
-        while idx < self.cap - 1:
-            left, right = 2 * idx + 1, 2 * idx + 2
-            idx = left if v <= self.tree[left] else right
-            v -= self.tree[left] * (idx == right)
-        return idx - self.cap + 1
-
+    def __init__(self,cap:int,α:float=0.6,β:float=0.4,β_increment:float=0.001,ε:float=1e-5):
+        self.capacity,self.α,self.β,self.β_increment,self.ε=cap,α,β,β_increment,ε
+        self.tree,self.data,self.size,self.max_priority=np.zeros(2*cap-1),np.zeros(cap,dtype=object),0,1.0
+    def _propagate(self,idx:int,change:float):
+        parent=(idx-1)//2;self.tree[parent]+=change
+        if parent!=0:self._propagate(parent,change)
+    def _retrieve(self,idx:int,s:float)->int:
+        left,right=2*idx+1,2*idx+2
+        if left>=len(self.tree):return idx
+        return self._retrieve(left,s) if s<=self.tree[left] else self._retrieve(right,s-self.tree[left])
+    def add(self,experience:Exp,error:float):
+        idx=self.size+self.capacity-1;self.data[self.size]=experience
+        self.size=min(self.size+1,self.capacity);self.update(idx,error)
+    def update(self,idx:int,error:float):
+        priority=(error+self.ε)**self.α;change=priority-self.tree[idx]
+        self.tree[idx]=priority;self._propagate(idx,change)
+        self.max_priority=max(self.max_priority,priority)
+    def sample(self,batch_size:int)->Tuple[List[Exp],List[int],np.ndarray]:
+        batch,idxs,priorities=[],[],np.empty((batch_size,),dtype=np.float32)
+        segment=self.tree[0]/batch_size;self.β=min(1.,self.β+self.β_increment)
+        for i in range(batch_size):
+            a,b=segment*i,segment*(i+1);s=random.uniform(a,b);idx=self._retrieve(0,s)
+            priorities[i]=self.tree[idx];idxs.append(idx);batch.append(self.data[idx-self.capacity+1])
+        sampling_probabilities=priorities/self.tree[0]
+        weights=(self.size*sampling_probabilities)**-self.β;weights/=weights.max()
+        return batch,idxs,weights
+    
 class NoisyLinear(nn.Module):
-    def __init__(self, in_f: int, out_f: int, σ: float = 0.5):
-        super().__init__()
-        self.μw, self.σw = nn.Parameter(torch.empty(out_f, in_f)), nn.Parameter(torch.empty(out_f, in_f))
-        self.μb, self.σb = nn.Parameter(torch.empty(out_f)), nn.Parameter(torch.empty(out_f))
-        self.reset_parameters(); self.reset_noise()
-
+    
+    def __init__(self,in_features:int,out_features:int,std_init:float=0.5):
+        super(NoisyLinear,self).__init__()
+        self.in_features,self.out_features,self.std_init=in_features,out_features,std_init
+        self.weight_mu=nn.Parameter(torch.FloatTensor(out_features,in_features))
+        self.weight_sigma=nn.Parameter(torch.FloatTensor(out_features,in_features))
+        self.register_buffer('weight_epsilon',torch.FloatTensor(out_features,in_features))
+        self.bias_mu=nn.Parameter(torch.FloatTensor(out_features))
+        self.bias_sigma=nn.Parameter(torch.FloatTensor(out_features))
+        self.register_buffer('bias_epsilon',torch.FloatTensor(out_features))
+        self.reset_parameters();self.reset_noise()
     def reset_parameters(self):
-        μ_range = 1 / np.sqrt(self.μw.size(1))
-        self.μw.data.uniform_(-μ_range, μ_range); self.σw.data.fill_(self.σ / np.sqrt(self.σw.size(1)))
-        self.μb.data.uniform_(-μ_range, μ_range); self.σb.data.fill_(self.σ / np.sqrt(self.σb.size(0)))
-
+        mu_range=1/math.sqrt(self.weight_mu.size(1))
+        self.weight_mu.data.uniform_(-mu_range,mu_range)
+        self.weight_sigma.data.fill_(self.std_init/math.sqrt(self.weight_sigma.size(1)))
+        self.bias_mu.data.uniform_(-mu_range,mu_range)
+        self.bias_sigma.data.fill_(self.std_init/math.sqrt(self.bias_sigma.size(0)))
     def reset_noise(self):
-        εi, εj = [self._scale_noise(s) for s in self.μw.size()]
-        self.εw, self.εb = εj.outer(εi), εj
-
-    def _scale_noise(self, size: int): return torch.randn(size).sign().mul(torch.rand(size).sqrt())
-
-    def forward(self, x: torch.Tensor): return F.linear(x, self.μw + self.σw * self.εw, self.μb + self.σb * self.εb)
-
-class Net(nn.Module):
-    def __init__(self, s: int, a: int, h: List[int], d: float = 0.1):
-        super().__init__()
-        self.feat = nn.Sequential(nn.Linear(s, h[0]), nn.ReLU(), nn.LayerNorm(h[0]), nn.Dropout(d),
-            *sum([[NoisyLinear(i, o), nn.ReLU(), nn.LayerNorm(o), nn.Dropout(d)] for i, o in zip(h, h[1:])], []))
-        self.v, self.a = NoisyLinear(h[-1], 1), NoisyLinear(h[-1], a)
-
-    def forward(self, x: torch.Tensor):
-        f = self.feat(x)
-        return self.v(f) + self.a(f) - self.a(f).mean(1, keepdim=True)
-
-class RISE:
-    def __init__(self, s: int, a: int, h: List[int], γ: float = 0.99, τ: float = 5e-3, lr: float = 3e-4, α: float = 0.2, n: int = 3):
-        self.q, self.tq = Net(s, a, h), Net(s, a, h)
-        self.tq.load_state_dict(self.q.state_dict())
-        self.opt = optim.Adam(self.q.parameters(), lr)
-        self.scheduler = optim.lr_scheduler.StepLR(self.opt, step_size=100, gamma=0.99)
-        self.γ, self.τ, self.α, self.a, self.n = γ, τ, α, a, n
-
-    def act(self, s: np.ndarray, ε: float = 0.) -> int:
-        return np.random.randint(self.a) if np.random.rand() < ε else self.q(torch.FloatTensor(s)).argmax().item()
-
-    def learn(self, b: List[Exp], w: np.ndarray):
-        s, a, r, ns, d, _ = map(torch.tensor, zip(*b))
-        q = self.q(s).gather(1, a.unsqueeze(1)).squeeze(1)
-        nq = self.tq(ns).max(1)[0]
-        eq = (r + self.γ**self.n * nq * (1-d)).detach()
-        loss = (torch.FloatTensor(w) * F.mse_loss(q, eq, reduction='none')).mean()
-        p = Categorical(F.softmax(self.q(s), dim=1))
-        loss -= self.α * p.entropy().mean()
-        self.opt.zero_grad(); loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.q.parameters(), 1.0)
-        self.opt.step(); self.scheduler.step()
-        for tp, p in zip(self.tq.parameters(), self.q.parameters()): tp.data.copy_(self.τ * p.data + (1 - self.τ) * tp.data)
-        return loss.item(), p.entropy().mean().item(), ((q - eq).abs().detach().numpy() + 1e-6)
-
+        epsilon_in=self._scale_noise(self.in_features)
+        epsilon_out=self._scale_noise(self.out_features)
+        self.weight_epsilon.copy_(epsilon_out.ger(epsilon_in))
+        self.bias_epsilon.copy_(self._scale_noise(self.out_features))
+    def _scale_noise(self,size:int):
+        x=torch.randn(size);return x.sign().mul(x.abs().sqrt())
+    def forward(self,inp:torch.Tensor):
+        return F.linear(inp,self.weight_mu+self.weight_sigma*self.weight_epsilon,
+                        self.bias_mu+self.bias_sigma*self.bias_epsilon) if self.training else F.linear(inp,self.weight_mu,self.bias_mu)
+        
+class DuelingDQN(nn.Module):
+    def __init__(self,state_dim:int,action_dim:int,hidden_dim:List[int]):
+        super(DuelingDQN,self).__init__()
+        self.feature=nn.Sequential(nn.Linear(state_dim,hidden_dim[0]),nn.ReLU(),
+                                   NoisyLinear(hidden_dim[0],hidden_dim[1]),nn.ReLU())
+        self.advantage=nn.Sequential(NoisyLinear(hidden_dim[1],hidden_dim[2]),nn.ReLU(),
+                                     NoisyLinear(hidden_dim[2],action_dim))
+        self.value=nn.Sequential(NoisyLinear(hidden_dim[1],hidden_dim[2]),nn.ReLU(),
+                                 NoisyLinear(hidden_dim[2],1))
+    def forward(self,x:torch.Tensor):
+        feature=self.feature(x);advantage=self.advantage(feature);value=self.value(feature)
+        return value+advantage-advantage.mean(dim=-1,keepdim=True)
+    
+class Rainbow:
+    def __init__(self,state_dim:int,action_dim:int,hidden_dim:List[int],learning_rate:float=3e-4,
+                 gamma:float=0.99,tau:float=5e-3,alpha:float=0.2,n_step:int=3):
+        self.q=DuelingDQN(state_dim,action_dim,hidden_dim)
+        self.target_q=DuelingDQN(state_dim,action_dim,hidden_dim)
+        self.target_q.load_state_dict(self.q.state_dict())
+        self.optimizer=optim.Adam(self.q.parameters(),lr=learning_rate)
+        self.gamma,self.tau,self.alpha,self.n_step,self.action_dim=gamma,tau,alpha,n_step,action_dim
+    def act(self,state:np.ndarray,epsilon:float=0.)->int:
+        return random.randint(0,self.action_dim-1) if random.random()<epsilon else self.q(torch.FloatTensor(state)).argmax().item()
+    def learn(self,experiences:List[Exp],weights:np.ndarray):
+        states,actions,rewards,next_states,dones,_=map(torch.tensor,zip(*experiences))
+        q_values=self.q(states).gather(1,actions.unsqueeze(1)).squeeze(1)
+        next_q_values=self.target_q(next_states).max(1)[0]
+        expected_q_values=(rewards+self.gamma**self.n_step*next_q_values*(1-dones)).detach()
+        loss=(torch.FloatTensor(weights)*F.mse_loss(q_values,expected_q_values,reduction='none')).mean()
+        policy=Categorical(F.softmax(self.q(states),dim=1))
+        loss-=self.alpha*policy.entropy().mean()
+        self.optimizer.zero_grad();loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.q.parameters(),1.0)
+        self.optimizer.step()
+        for target_param,param in zip(self.target_q.parameters(),self.q.parameters()):
+            target_param.data.copy_(self.tau*param.data+(1.0-self.tau)*target_param.data)
+        return loss.item(),policy.entropy().mean().item(),((q_values-expected_q_values).abs().detach().numpy()+1e-6)
+    
+    
 class Trainer:
-    def __init__(self, env: gym.Env, agent: RISE, bs: int = 64, n: int = 1000, spi: int = 1000, ue: int = 4, sε: float = 1., eε: float = 0.01, εd: float = 0.995):
-        self.env, self.agent, self.bs, self.n, self.spi = env, agent, bs, n, spi
-        self.ue, self.ε, self.eε, self.εd = ue, sε, eε, εd
-        self.buf, self.n_step_buf = PER(1_000_000), deque(maxlen=agent.n)
-
+    def __init__(self,env:gym.Env,agent:Rainbow,batch_size:int=64,num_episodes:int=1000,
+                 steps_per_episode:int=1000,update_every:int=4,start_epsilon:float=1.0,
+                 end_epsilon:float=0.01,epsilon_decay:float=0.995):
+        self.env,self.agent,self.batch_size,self.num_episodes=env,agent,batch_size,num_episodes
+        self.steps_per_episode,self.update_every=steps_per_episode,update_every
+        self.epsilon,self.end_epsilon,self.epsilon_decay=start_epsilon,end_epsilon,epsilon_decay
+        self.memory,self.n_step_buffer=PER(1_000_000),deque(maxlen=agent.n_step)
     def n_step_learn(self):
-        if len(self.n_step_buf) < self.agent.n: return
-        r = sum([e.r * self.agent.γ**i for i, e in enumerate(self.n_step_buf)])
-        self.buf.add(Exp(self.n_step_buf[0].s, self.n_step_buf[0].a, r, self.n_step_buf[-1].ns, self.n_step_buf[-1].d, 1))
-
+        if len(self.n_step_buffer)<self.agent.n_step:return
+        reward=sum([e.r*self.agent.gamma**i for i,e in enumerate(self.n_step_buffer)])
+        state,action,_,next_state,done=self.n_step_buffer[-1]
+        self.memory.add(Exp(self.n_step_buffer[0].s,action,reward,next_state,done,1),reward)
     def train(self):
-        for i in range(self.n):
-            s, d, r, ts = self.env.reset(), False, 0, 0
-            while not d and ts < self.spi:
-                a = self.agent.act(s, self.ε)
-                ns, rw, d, _ = self.env.step(a)
-                self.n_step_buf.append(Exp(s, a, rw, ns, d, 1))
-                self.n_step_learn()
-                s, r, ts = ns, r + rw, ts + 1
-                if len(self.buf.data) > self.bs and ts % self.ue == 0:
-                    b, idx, w = self.buf.sample(self.bs)
-                    l, e, prios = self.agent.learn(b, w)
-                    self.buf.update(idx, prios)
-            self.ε = max(self.eε, self.ε * self.εd)
-            print(f"Iter {i+1}/{self.n}, R: {r:.2f}, ε: {self.ε:.3f}")
-
-    def eval(self, n: int = 100) -> float:
-        return np.mean([sum(self.env.step(self.agent.act(s))[1] for s in [self.env.reset()] for _ in iter(lambda: self.env.step(self.agent.act(s))[2], True)) for _ in range(n)])
-
-if __name__ == "__main__":
-    env = gym.make('CartPole-v1')
-    agent = RISE(env.observation_space.shape[0], env.action_space.n, [64, 64])
-    trainer = Trainer(env, agent)
-    trainer.train()
-    print(f"Avg R: {trainer.eval():.2f}")
+        for i_episode in range(self.num_episodes):
+            state,done=self.env.reset(),False;episode_reward=0
+            for t in range(self.steps_per_episode):
+                action=self.agent.act(state,self.epsilon)
+                next_state,reward,done,_=self.env.step(action)
+                self.n_step_buffer.append(Exp(state,action,reward,next_state,done,1))
+                self.n_step_learn();state=next_state;episode_reward+=reward
+                if len(self.memory.data)>self.batch_size and t%self.update_every==0:
+                    experiences,indices,weights=self.memory.sample(self.batch_size)
+                    loss,entropy,priorities=self.agent.learn(experiences,weights)
+                    for idx,priority in zip(indices,priorities):self.memory.update(idx,priority)
+                if done:break
+            self.epsilon=max(self.end_epsilon,self.epsilon*self.epsilon_decay)
+            print(f"Episode {i_episode+1}/{self.num_episodes}, Reward: {episode_reward:.2f}, Epsilon: {self.epsilon:.3f}")
+    def evaluate(self,num_episodes:int=100)->float:
+        return np.mean([sum(self.env.step(self.agent.act(s))[1] for s in [self.env.reset()] for _ in iter(lambda:self.env.step(self.agent.act(s))[2],True)) for _ in range(num_episodes)])
+if __name__=="__main__":
+    env=gym.make('CartPole-v1')
+    agent=Rainbow(env.observation_space.shape[0],env.action_space.n,[64,64,32])
+    trainer=Trainer(env,agent);trainer.train()
+    print(f"Average Reward: {trainer.evaluate():.2f}")
