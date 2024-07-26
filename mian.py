@@ -13,29 +13,24 @@ class PER:
 
     def add(self, e: Exp):
         idx = self.ptr + self.cap - 1
-        self.data[self.ptr] = e
-        self.update(idx, self.max_p)
-        self.ptr = (self.ptr + 1) % self.cap
-        self.size = min(self.size + 1, self.cap)
+        self.data[self.ptr] = e; self.update(idx, self.max_p)
+        self.ptr = (self.ptr + 1) % self.cap; self.size = min(self.size + 1, self.cap)
 
     def update(self, idx: int, p: float):
-        change, self.tree[idx] = p - self.tree[idx], p
-        while idx := (idx - 1) // 2: self.tree[idx] += change
-        self.max_p = max(p, self.max_p)
+        change = p - self.tree[idx]; self.max_p = max(p, self.max_p)
+        while idx >= 0: self.tree[idx] += change; idx = (idx - 1) // 2
 
     def sample(self, n: int):
         idxs = [self.get(np.random.uniform(i*seg, (i+1)*seg)) for i, seg in enumerate(np.linspace(0, self.tree[0], n+1)[:-1])]
-        batch = [self.data[i] for i in idxs]
         probs = self.tree[idxs + self.cap - 1] / self.tree[0]
         self.β = min(1., self.β + self.βi)
         weights = (self.size * probs) ** -self.β / max((self.size * probs) ** -self.β)
-        return batch, idxs, weights
+        return [self.data[i] for i in idxs], idxs, weights
 
     def get(self, v: float):
         idx = 0
         while idx < self.cap - 1:
-            left = 2 * idx + 1
-            right = left + 1  # Define right here
+            left, right = 2 * idx + 1, 2 * idx + 2
             idx = left if v <= self.tree[left] else right
             v -= self.tree[left] * (idx == right)
         return idx - self.cap + 1
@@ -45,32 +40,26 @@ class NoisyLinear(nn.Module):
         super().__init__()
         self.μw, self.σw = nn.Parameter(torch.empty(out_f, in_f)), nn.Parameter(torch.empty(out_f, in_f))
         self.μb, self.σb = nn.Parameter(torch.empty(out_f)), nn.Parameter(torch.empty(out_f))
-        self.reset_parameters()
-        self.reset_noise()
+        self.reset_parameters(); self.reset_noise()
 
     def reset_parameters(self):
         μ_range = 1 / np.sqrt(self.μw.size(1))
-        self.μw.data.uniform_(-μ_range, μ_range)
-        self.σw.data.fill_(self.σ / np.sqrt(self.σw.size(1)))
-        self.μb.data.uniform_(-μ_range, μ_range)
-        self.σb.data.fill_(self.σ / np.sqrt(self.σb.size(0)))
+        self.μw.data.uniform_(-μ_range, μ_range); self.σw.data.fill_(self.σ / np.sqrt(self.σw.size(1)))
+        self.μb.data.uniform_(-μ_range, μ_range); self.σb.data.fill_(self.σ / np.sqrt(self.σb.size(0)))
 
     def reset_noise(self):
         εi, εj = [self._scale_noise(s) for s in self.μw.size()]
         self.εw, self.εb = εj.outer(εi), εj
 
-    def _scale_noise(self, size: int):
-        return torch.randn(size).sign().mul(torch.rand(size).sqrt())
+    def _scale_noise(self, size: int): return torch.randn(size).sign().mul(torch.rand(size).sqrt())
 
-    def forward(self, x: torch.Tensor):
-        return F.linear(x, self.μw + self.σw * self.εw, self.μb + self.σb * self.εb)
+    def forward(self, x: torch.Tensor): return F.linear(x, self.μw + self.σw * self.εw, self.μb + self.σb * self.εb)
 
 class Net(nn.Module):
     def __init__(self, s: int, a: int, h: List[int], d: float = 0.1):
         super().__init__()
         self.feat = nn.Sequential(nn.Linear(s, h[0]), nn.ReLU(), nn.LayerNorm(h[0]), nn.Dropout(d),
-            *sum([[NoisyLinear(i, o), nn.ReLU(), nn.LayerNorm(o), nn.Dropout(d)]
-                  for i, o in zip(h, h[1:])], []))
+            *sum([[NoisyLinear(i, o), nn.ReLU(), nn.LayerNorm(o), nn.Dropout(d)] for i, o in zip(h, h[1:])], []))
         self.v, self.a = NoisyLinear(h[-1], 1), NoisyLinear(h[-1], a)
 
     def forward(self, x: torch.Tensor):
@@ -82,6 +71,7 @@ class RISE:
         self.q, self.tq = Net(s, a, h), Net(s, a, h)
         self.tq.load_state_dict(self.q.state_dict())
         self.opt = optim.Adam(self.q.parameters(), lr)
+        self.scheduler = optim.lr_scheduler.StepLR(self.opt, step_size=100, gamma=0.99)
         self.γ, self.τ, self.α, self.a, self.n = γ, τ, α, a, n
 
     def act(self, s: np.ndarray, ε: float = 0.) -> int:
@@ -95,11 +85,10 @@ class RISE:
         loss = (torch.FloatTensor(w) * F.mse_loss(q, eq, reduction='none')).mean()
         p = Categorical(F.softmax(self.q(s), dim=1))
         loss -= self.α * p.entropy().mean()
-        self.opt.zero_grad()
-        loss.backward()
-        self.opt.step()
-        for tp, p in zip(self.tq.parameters(), self.q.parameters()):
-            tp.data.copy_(self.τ * p.data + (1 - self.τ) * tp.data)
+        self.opt.zero_grad(); loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.q.parameters(), 1.0)
+        self.opt.step(); self.scheduler.step()
+        for tp, p in zip(self.tq.parameters(), self.q.parameters()): tp.data.copy_(self.τ * p.data + (1 - self.τ) * tp.data)
         return loss.item(), p.entropy().mean().item(), ((q - eq).abs().detach().numpy() + 1e-6)
 
 class Trainer:
