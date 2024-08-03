@@ -1,7 +1,8 @@
-import numpy as np,torch,torch.nn as nn,torch.nn.functional as F,torch.optim as optim,gym,random,math
+import numpy as np,torch,torch.nn as nn,torch.nn.functional as F,torch.optim as optim,gym,math
 from typing import NamedTuple,List,Tuple
 from torch.distributions import Categorical
 from collections import deque,namedtuple
+import secrets
 
 
 Exp=namedtuple('Exp','s a r ns d i')
@@ -28,7 +29,7 @@ class PER:
         batch,idxs,priorities=[],[],np.empty((batch_size,),dtype=np.float32)
         segment=self.tree[0]/batch_size;self.β=min(1.,self.β+self.β_increment)
         for i in range(batch_size):
-            a,b=segment*i,segment*(i+1);s=random.uniform(a,b);idx=self._retrieve(0,s)
+            a,b=segment*i,segment*(i+1);s=secrets.SystemRandom().uniform(a,b);idx=self._retrieve(0,s)
             priorities[i]=self.tree[idx];idxs.append(idx);batch.append(self.data[idx-self.capacity+1])
         sampling_probabilities=priorities/self.tree[0]
         weights=(self.size*sampling_probabilities)**-self.β;weights/=weights.max()
@@ -85,7 +86,7 @@ class Rainbow:
         self.optimizer=optim.Adam(self.q.parameters(),lr=learning_rate)
         self.gamma,self.tau,self.alpha,self.n_step,self.action_dim=gamma,tau,alpha,n_step,action_dim
     def act(self,state:np.ndarray,epsilon:float=0.)->int:
-        return random.randint(0,self.action_dim-1) if random.random()<epsilon else self.q(torch.FloatTensor(state)).argmax().item()
+        return secrets.SystemRandom().randint(0,self.action_dim-1) if secrets.SystemRandom().random()<epsilon else self.q(torch.FloatTensor(state)).argmax().item()
     def learn(self,experiences:List[Exp],weights:np.ndarray):
         states,actions,rewards,next_states,dones,_=map(torch.tensor,zip(*experiences))
         q_values=self.q(states).gather(1,actions.unsqueeze(1)).squeeze(1)
