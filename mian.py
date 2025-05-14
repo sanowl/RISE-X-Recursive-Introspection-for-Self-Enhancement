@@ -4,11 +4,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import gym
-import random
 import math
 from typing import NamedTuple, List, Tuple
 from torch.distributions import Categorical
 from collections import deque, namedtuple
+import secrets
 
 Exp = namedtuple('Exp', 's a r ns d i')
 
@@ -52,7 +52,7 @@ class PER:
         self.β = min(1., self.β + self.β_increment)
         for i in range(batch_size):
             a, b = segment * i, segment * (i + 1)
-            s = random.uniform(a, b)
+            s = secrets.SystemRandom().uniform(a, b)
             idx = self._retrieve(0, s)
             priorities[i] = self.tree[idx]
             idxs.append(idx)
@@ -138,8 +138,8 @@ class Rainbow:
         self.gamma, self.tau, self.alpha, self.n_step, self.action_dim = gamma, tau, alpha, n_step, action_dim
 
     def act(self, state: np.ndarray, epsilon: float = 0.) -> int:
-        if random.random() < epsilon:
-            return random.randint(0, self.action_dim - 1)
+        if secrets.SystemRandom().random() < epsilon:
+            return secrets.SystemRandom().randint(0, self.action_dim - 1)
         else:
             return self.q(torch.FloatTensor(state)).argmax().item()
 
